@@ -1,15 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
-import { Activity, AlertTriangle, FlaskConical, Loader2, RefreshCw } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Activity, AlertTriangle, FlaskConical, Radio } from "lucide-react"
 
 import { AxisToggle, type AxisMode } from "@/components/AxisToggle"
 import { ExpirySelector } from "@/components/ExpirySelector"
 import { GexChart } from "@/components/GexChart"
 import { MetricTile } from "@/components/MetricTile"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { api, fmt, type ExpiryInfo, type GexSnapshot, type Health } from "@/lib/api"
+import { type StreamStatus, useGexStream } from "@/lib/useGexStream"
 
 const SYMBOL = "SPX"
 
@@ -17,54 +17,49 @@ function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [expiries, setExpiries] = useState<ExpiryInfo[]>([])
   const [expiry, setExpiry] = useState<string | undefined>(undefined)
-  const [snapshot, setSnapshot] = useState<GexSnapshot | null>(null)
   const [axis, setAxis] = useState<AxisMode>("spot")
   const [useMock, setUseMock] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [expiriesLoading, setExpiriesLoading] = useState(true)
+  const [expiriesError, setExpiriesError] = useState<string | null>(null)
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null))
   }, [])
 
   useEffect(() => {
-    setLoading(true)
+    let cancelled = false
+    setExpiriesLoading(true)
+    setExpiriesError(null)
     api
       .expiries(SYMBOL, { useMock })
       .then((rows) => {
+        if (cancelled) return
         setExpiries(rows)
         setExpiry((current) => {
           if (current && rows.some((r) => r.expiry === current)) return current
           return rows[0]?.expiry
         })
       })
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false))
+      .catch((e: Error) => {
+        if (!cancelled) setExpiriesError(e.message)
+      })
+      .finally(() => {
+        if (!cancelled) setExpiriesLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [useMock])
 
-  const loadSnapshot = useCallback(
-    async (chosenExpiry: string, indicator: "initial" | "refresh") => {
-      if (indicator === "initial") setLoading(true)
-      else setRefreshing(true)
-      setError(null)
-      try {
-        const snap = await api.gex(SYMBOL, { expiry: chosenExpiry, useMock })
-        setSnapshot(snap)
-      } catch (e) {
-        setError((e as Error).message)
-      } finally {
-        setLoading(false)
-        setRefreshing(false)
-      }
-    },
-    [useMock],
-  )
+  const { snapshot, status, error, lastUpdateAt } = useGexStream({
+    symbol: SYMBOL,
+    expiry,
+    useMock,
+    enabled: Boolean(expiry),
+  })
 
-  useEffect(() => {
-    if (!expiry) return
-    void loadSnapshot(expiry, "initial")
-  }, [expiry, loadSnapshot])
+  const isLoading = !snapshot && (expiriesLoading || status === "connecting" || status === "idle")
+  const fatalError = expiriesError ?? (snapshot ? null : error)
 
   const totalNetSign = useMemo(() => {
     if (!snapshot) return 0
@@ -83,10 +78,10 @@ function App() {
         <Header
           snapshot={snapshot}
           health={health}
+          status={status}
+          lastUpdateAt={lastUpdateAt}
           useMock={useMock}
           onUseMockChange={setUseMock}
-          onRefresh={() => expiry && loadSnapshot(expiry, "refresh")}
-          refreshing={refreshing}
         />
 
         <Controls
@@ -95,7 +90,7 @@ function App() {
           onExpiryChange={setExpiry}
           axis={axis}
           onAxisChange={setAxis}
-          loading={loading && expiries.length === 0}
+          loading={expiriesLoading && expiries.length === 0}
           basisHint={
             snapshot ? (
               <span className="text-zinc-500">
@@ -113,13 +108,13 @@ function App() {
           }
         />
 
-        <Metrics snapshot={snapshot} loading={loading} />
+        <Metrics snapshot={snapshot} loading={isLoading} />
 
         <ChartCard
           snapshot={snapshot}
           axis={axis}
-          loading={loading}
-          error={error}
+          loading={isLoading}
+          error={fatalError}
           totalNetSign={totalNetSign}
         />
 
@@ -129,20 +124,94 @@ function App() {
   )
 }
 
+function StreamPill({
+  status,
+  isMock,
+  lastUpdateAt,
+}: {
+  status: StreamStatus
+  isMock: boolean
+  lastUpdateAt: number | null
+}) {
+  if (isMock) {
+    return (
+      <Badge variant="mock">
+        <FlaskConical className="h-3 w-3" />
+        Mock
+      </Badge>
+    )
+  }
+  const cfg = pillConfigForStatus(status)
+  return (
+    <Badge variant={cfg.variant}>
+      <span className={`h-1.5 w-1.5 rounded-full ${cfg.dotClass}`} />
+      {cfg.label}
+      {lastUpdateAt && status !== "idle" && (
+        <span className="ml-1 text-[10px] text-zinc-500 tabular-nums">
+          {ageString(lastUpdateAt)}
+        </span>
+      )}
+    </Badge>
+  )
+}
+
+function pillConfigForStatus(status: StreamStatus): {
+  label: string
+  variant: "live" | "positive" | "negative" | "mock"
+  dotClass: string
+} {
+  switch (status) {
+    case "live":
+      return {
+        label: "Live",
+        variant: "live",
+        dotClass: "bg-emerald-400 [animation:pulse_1.5s_ease-in-out_infinite]",
+      }
+    case "fallback":
+      return {
+        label: "REST fallback",
+        variant: "positive",
+        dotClass: "bg-amber-400",
+      }
+    case "connecting":
+    case "idle":
+      return {
+        label: "Connecting",
+        variant: "positive",
+        dotClass: "bg-zinc-500 [animation:pulse_1s_ease-in-out_infinite]",
+      }
+    case "error":
+      return {
+        label: "Disconnected",
+        variant: "negative",
+        dotClass: "bg-rose-400",
+      }
+  }
+}
+
+function ageString(ts: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (seconds < 5) return "now"
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  return `${Math.floor(minutes / 60)}h ago`
+}
+
 function Header({
   snapshot,
   health,
+  status,
+  lastUpdateAt,
   useMock,
   onUseMockChange,
-  onRefresh,
-  refreshing,
 }: {
   snapshot: GexSnapshot | null
   health: Health | null
+  status: StreamStatus
+  lastUpdateAt: number | null
   useMock: boolean
   onUseMockChange: (v: boolean) => void
-  onRefresh: () => void
-  refreshing: boolean
 }) {
   const isMockData = snapshot?.is_mock ?? useMock
   return (
@@ -170,29 +239,12 @@ function Header({
         </div>
       </div>
       <div className="flex items-center gap-3">
-        {isMockData ? (
-          <Badge variant="mock">
-            <FlaskConical className="h-3 w-3" />
-            Mock data
-          </Badge>
-        ) : (
-          <Badge variant="live">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 [animation:pulse_2s_ease-in-out_infinite]" />
-            Snapshot
-          </Badge>
-        )}
+        <StreamPill status={status} isMock={isMockData} lastUpdateAt={lastUpdateAt} />
         <div className="flex items-center gap-2 rounded-full border border-zinc-800/70 bg-zinc-900/40 px-3 py-1.5 backdrop-blur-xl">
+          <Radio className="h-3 w-3 text-zinc-500" />
           <span className="text-[11px] uppercase tracking-wider text-zinc-500">Mock</span>
           <Switch checked={useMock} onCheckedChange={onUseMockChange} />
         </div>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
-          {refreshing ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <RefreshCw className="h-4 w-4" />
-          )}
-          Refresh
-        </Button>
         {health && !health.opra_key_configured && (
           <Badge variant="negative">
             <AlertTriangle className="h-3 w-3" />
