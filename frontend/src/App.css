@@ -1,0 +1,9 @@
+/* Override Vite scaffold defaults so app fills the viewport.
+ * Layout is owned by Tailwind utilities in components, not this stylesheet. */
+#root {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  text-align: left;
+}
