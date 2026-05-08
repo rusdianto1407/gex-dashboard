@@ -36,10 +36,77 @@ ES_PARENT = "ES.FUT"
 OPEN_INTEREST_STAT_TYPE = 9
 
 DEFAULT_LOOKBACK_HOURS = 6
+HISTORICAL_LAG_MINUTES = 20
+DATASET_RANGE_TTL_S = 300
 
 
 class SnapshotError(RuntimeError):
     """Raised when a real-data snapshot cannot be assembled."""
+
+
+_dataset_end_cache: dict[str, tuple[float, datetime]] = {}
+
+
+def _dataset_end_cached(client: Any, dataset: str) -> datetime | None:
+    """Latest timestamp Databento has published for `dataset`, cached for 5 min.
+
+    Markets close ~21:30 UTC (OPRA) / ~22:00 UTC (GLBX) but Historical replay
+    can lag arbitrarily, so we query `metadata.get_dataset_range` to discover
+    the real frontier instead of guessing with a constant lag.
+    """
+    now = datetime.now(UTC).timestamp()
+    cached = _dataset_end_cache.get(dataset)
+    if cached and now - cached[0] < DATASET_RANGE_TTL_S:
+        return cached[1]
+    try:
+        info = client.metadata.get_dataset_range(dataset=dataset)
+    except Exception as exc:  # pragma: no cover - network/auth path
+        logger.warning("metadata.get_dataset_range(%s) failed: %s", dataset, exc)
+        return None
+    end_raw = (
+        info.get("end")
+        or info.get("end_date")
+        or info.get("schema", {}).get("definition", {}).get("end")
+    )
+    if not end_raw:
+        return None
+    try:
+        end_ts = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("could not parse dataset end %r", end_raw)
+        return None
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.replace(tzinfo=UTC)
+    _dataset_end_cache[dataset] = (now, end_ts)
+    return end_ts
+
+
+def historical_window(
+    *,
+    lookback: timedelta,
+    client: Any | None = None,
+    dataset: str = OPRA_DATASET,
+    lag: timedelta = timedelta(minutes=HISTORICAL_LAG_MINUTES),
+) -> tuple[datetime, datetime]:
+    """Return a `(start, end)` window safely behind the publication frontier.
+
+    Two failure modes Databento Historical surfaces if you're sloppy:
+
+    * `data_end_after_available_end` — `end` is past the dataset's frontier
+      (publication lag spikes overnight after the close). Solved by clamping
+      to `metadata.get_dataset_range` when a client is supplied, falling back
+      to `now - lag`.
+    * `data_start_too_precise_to_forward_fill` — sub-second `start` with no
+      `end`. Solved by rounding both ends down to whole minutes.
+    """
+    candidate = (datetime.now(UTC) - lag).replace(second=0, microsecond=0)
+    if client is not None:
+        ds_end = _dataset_end_cached(client, dataset)
+        if ds_end is not None:
+            candidate = min(candidate, ds_end.replace(second=0, microsecond=0))
+    end = candidate
+    start = (end - lookback).replace(second=0, microsecond=0)
+    return start, end
 
 
 @dataclass(slots=True)
@@ -77,8 +144,9 @@ def list_spx_expiries(opra_key: str | None, horizon_days: int) -> list[tuple[dat
     any index-quote spurious rows.
     """
     client = _historical(opra_key)
-    end = datetime.now(UTC)
-    start = end - timedelta(days=2)
+    start, end = historical_window(
+        lookback=timedelta(days=2), client=client, dataset=OPRA_DATASET
+    )
     try:
         data = client.timeseries.get_range(
             dataset=OPRA_DATASET,
@@ -116,8 +184,9 @@ def list_spx_expiries(opra_key: str | None, horizon_days: int) -> list[tuple[dat
 
 def _fetch_definitions(client: Any, expiry: date) -> Any:
     """Fetch SPX/SPXW definitions and filter to the requested expiry."""
-    end = datetime.now(UTC)
-    start = end - timedelta(days=2)
+    start, end = historical_window(
+        lookback=timedelta(days=2), client=client, dataset=OPRA_DATASET
+    )
     data = client.timeseries.get_range(
         dataset=OPRA_DATASET,
         schema="definition",
@@ -142,8 +211,11 @@ def _fetch_definitions(client: Any, expiry: date) -> Any:
 
 def _fetch_latest_bbo(client: Any, raw_symbols: list[str], lookback_hours: int) -> Any:
     """Pull the most recent CBBO-1m record per instrument."""
-    end = datetime.now(UTC)
-    start = end - timedelta(hours=lookback_hours)
+    start, end = historical_window(
+        lookback=timedelta(hours=lookback_hours),
+        client=client,
+        dataset=OPRA_DATASET,
+    )
     data = client.timeseries.get_range(
         dataset=OPRA_DATASET,
         schema="cbbo-1m",
@@ -161,8 +233,9 @@ def _fetch_latest_bbo(client: Any, raw_symbols: list[str], lookback_hours: int) 
 
 def _fetch_open_interest(client: Any, raw_symbols: list[str]) -> Any:
     """Pull the latest OI per instrument (stat_type=OPEN_INTEREST)."""
-    end = datetime.now(UTC)
-    start = end - timedelta(days=3)
+    start, end = historical_window(
+        lookback=timedelta(days=3), client=client, dataset=OPRA_DATASET
+    )
     try:
         data = client.timeseries.get_range(
             dataset=OPRA_DATASET,
@@ -188,8 +261,9 @@ def _fetch_open_interest(client: Any, raw_symbols: list[str]) -> Any:
 
 def _resolve_es_front_month(client: Any) -> tuple[str, date, float]:
     """Return (raw_symbol, expiry, last_trade_price) for the ES front-month future."""
-    end = datetime.now(UTC)
-    start = end - timedelta(days=2)
+    start, end = historical_window(
+        lookback=timedelta(days=2), client=client, dataset=GLBX_DATASET
+    )
     defs = client.timeseries.get_range(
         dataset=GLBX_DATASET,
         schema="definition",
@@ -214,14 +288,18 @@ def _resolve_es_front_month(client: Any) -> tuple[str, date, float]:
     front = defs.iloc[0]
     raw_symbol = str(front["raw_symbol"])
 
-    bbo_start = end - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
+    bbo_start, bbo_end = historical_window(
+        lookback=timedelta(hours=DEFAULT_LOOKBACK_HOURS),
+        client=client,
+        dataset=GLBX_DATASET,
+    )
     bbo = client.timeseries.get_range(
         dataset=GLBX_DATASET,
         schema="mbp-1",
         symbols=[raw_symbol],
         stype_in="raw_symbol",
         start=bbo_start,
-        end=end,
+        end=bbo_end,
     ).to_df()
     if bbo.empty:
         raise SnapshotError(f"no recent ES quotes for {raw_symbol}")

@@ -3,7 +3,7 @@
 Maintains an in-memory option-chain state populated from two Live sessions:
 
 * OPRA.PILLAR  — `definition` + `cbbo-1s` for SPX/SPXW options.
-* GLBX.MDP3    — `definition` + `cbbo-1s` for ES futures (front-month resolved
+* GLBX.MDP3    — `definition` + `bbo-1s` for ES futures (front-month resolved
   on the fly from the cheapest non-expired definition).
 
 A periodic Historical fetch refreshes open interest (OPRA `statistics`,
@@ -366,7 +366,7 @@ class LiveEngine:
         )
         live.subscribe(
             dataset=GLBX_DATASET,
-            schema="cbbo-1s",
+            schema="bbo-1s",
             symbols=[ES_PARENT],
             stype_in="parent",
         )
@@ -536,8 +536,8 @@ class LiveEngine:
             client = _historical(self.opra_key)
         except SnapshotError:
             return
-        end = datetime.now(UTC)
-        start = end - timedelta(days=3)
+        from app.databento_client import historical_window
+        start, end = historical_window(lookback=timedelta(days=3))
         try:
             data = client.timeseries.get_range(
                 dataset=OPRA_DATASET,
